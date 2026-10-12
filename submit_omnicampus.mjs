@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 /**
  * Omnicampus Submission & Score Automation (Batch Supported)
@@ -17,9 +19,30 @@ import path from 'node:path';
  */
 
 const ASSIGNMENT_URL = 'https://edu.omnicamp.us/en/courses/170/assignments/1038/';
+const LEADERBOARD_URL = 'https://edu.omnicamp.us/en/courses/170/assignments/1038/leader-board/';
 const BRAVE_DEBUG_URL = 'http://127.0.0.1:9222';
 const DEFAULT_WAIT_SECONDS = 60;
-const SETTLE_DELAY_MS = 3000;
+const SETTLE_DELAY_MS = 2000;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '..');
+const ENV_PATH = fs.existsSync(path.resolve('.env'))
+  ? path.resolve('.env')
+  : path.resolve(REPO_ROOT, '.env');
+
+function loadEnv() {
+  if (typeof process.loadEnvFile === 'function') {
+    try {
+      if (fs.existsSync(ENV_PATH)) {
+        process.loadEnvFile(ENV_PATH);
+      } else {
+        process.loadEnvFile();
+      }
+    } catch {}
+  }
+}
+loadEnv();
 
 function resolveInputFiles(targets) {
   const resolved = [];
@@ -63,10 +86,16 @@ function parseArgs() {
   const args = process.argv.slice(2);
   const targets = [];
   let waitSeconds = DEFAULT_WAIT_SECONDS;
+  let accountName = process.env.OMNICAMPUS_ACCOUNT_NAME || process.env.ACCOUNT_NAME || null;
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--wait' && args[i + 1]) {
+    if (args[i] === '--wait' && i + 1 < args.length) {
       waitSeconds = parseInt(args[i + 1], 10) || DEFAULT_WAIT_SECONDS;
+      i++;
+    } else if (args[i] === '--no-account') {
+      accountName = null;
+    } else if (args[i] === '--account' && i + 1 < args.length) {
+      accountName = args[i + 1].trim() || null;
       i++;
     } else if (!args[i].startsWith('--')) {
       targets.push(args[i]);
@@ -74,7 +103,7 @@ function parseArgs() {
   }
 
   if (targets.length === 0) {
-    console.error('Usage: node .devutil/submit_omnicampus.mjs <file_or_dir_or_glob...> [--wait 60]');
+    console.error('Usage: node .devutil/submit_omnicampus.mjs <file_or_dir_or_glob...> [--wait 60] [--account <name>]');
     process.exit(1);
   }
 
@@ -85,25 +114,59 @@ function parseArgs() {
     process.exit(1);
   }
 
-  return { files, waitSeconds };
+  return { files, waitSeconds, accountName };
+}
+
+async function ensureBraveReady() {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(`${BRAVE_DEBUG_URL}/json/version`, { signal: AbortSignal.timeout(1500) });
+      if (res.ok) return true;
+    } catch {}
+
+    if (attempt === 0) {
+      console.log('Brave port 9222 not reachable, running connection helper...');
+      try {
+        const helperPath = path.resolve('..', 'myskills', 'productivity', 'brave-browsing', 'scripts', 'ensure-brave.js');
+        if (fs.existsSync(helperPath)) {
+          execSync(`node "${helperPath}"`, { stdio: 'pipe' });
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return false;
 }
 
 async function getBraveTarget() {
-  let pages;
-  try {
-    const res = await fetch(`${BRAVE_DEBUG_URL}/json`, { signal: AbortSignal.timeout(2000) });
-    pages = await res.json();
-  } catch (err) {
-    throw new Error(`Failed to connect to Brave on ${BRAVE_DEBUG_URL}. Ensure Brave is running with --remote-debugging-port=9222. Error: ${err.message}`);
+  const isReady = await ensureBraveReady();
+  if (!isReady) {
+    throw new Error(`Failed to connect to Brave on ${BRAVE_DEBUG_URL}. Ensure Brave is running with --remote-debugging-port=9222.`);
   }
 
-  let omniPage = pages.find(p => p.url && p.url.includes('edu.omnicamp.us') && p.url.includes('assignments/1038'));
+  let pages;
+  try {
+    const res = await fetch(`${BRAVE_DEBUG_URL}/json`);
+    pages = await res.json();
+  } catch (err) {
+    throw new Error(`Failed to fetch page list from Brave on ${BRAVE_DEBUG_URL}: ${err.message}`);
+  }
 
+  // 1. Exact match on assignment 1038 submission page (exclude leaderboard subroute)
+  let omniPage = pages.find(p => p.type === 'page' && p.url && p.url.includes('assignments/1038') && !p.url.includes('/leader-board/'));
+
+  // 2. Fallback to any Omnicampus tab to repurpose and navigate
   if (!omniPage) {
-    console.log('Omnicampus assignment tab not found, creating new tab...');
+    omniPage = pages.find(p => p.type === 'page' && p.url && p.url.includes('edu.omnicamp.us'));
+  }
+
+  // 3. Create a new tab if no Omnicampus tab is found
+  if (!omniPage) {
+    console.log('No Omnicampus tab found in Brave, creating new tab...');
     const createRes = await fetch(`${BRAVE_DEBUG_URL}/json/new?${encodeURIComponent(ASSIGNMENT_URL)}`, { method: 'PUT' });
     omniPage = await createRes.json();
-    await new Promise(r => setTimeout(r, 3000));
   }
 
   return omniPage;
@@ -299,11 +362,135 @@ async function submitSingleFile(cdp, filePath, waitSeconds, batchIdx, totalFiles
   };
 }
 
+async function ensurePageReady(cdp) {
+  await cdp.send('Page.enable');
+
+  const currentUrl = await evaluate(cdp.send, 'window.location.href');
+  const isExactAssignmentPage = currentUrl && currentUrl.includes('assignments/1038') && !currentUrl.includes('/leader-board/');
+
+  if (!isExactAssignmentPage) {
+    console.log(`Current page is ${currentUrl || 'unknown'}. Navigating to ${ASSIGNMENT_URL}...`);
+    await cdp.send('Page.navigate', { url: ASSIGNMENT_URL });
+  }
+
+  console.log('Waiting for Omnicampus submission interface to load...');
+  let ready = false;
+  for (let i = 0; i < 40; i++) {
+    ready = await evaluate(cdp.send, `(() => {
+      const fileInput = document.querySelector('input[type="file"]');
+      const submitBtn = Array.from(document.querySelectorAll('button')).some(b => b.innerText.includes('Submit'));
+      return !!fileInput && submitBtn;
+    })()`);
+    if (ready) break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  if (!ready) {
+    throw new Error('Omnicampus page loaded, but submission controls were not found. Ensure you are logged into Omnicampus in Brave.');
+  }
+
+  console.log('Omnicampus submission interface is ready.');
+}
+
+async function getLeaderboardRanking(accountName) {
+  if (!accountName) return null;
+
+  let pages;
+  try {
+    const res = await fetch(`${BRAVE_DEBUG_URL}/json`);
+    pages = await res.json();
+  } catch {
+    return null;
+  }
+
+  let lbPage = pages.find(p => p.type === 'page' && p.url && p.url.includes('assignments/1038/leader-board'));
+
+  if (!lbPage) {
+    console.log('Opening Omnicampus leaderboard tab in Brave...');
+    const createRes = await fetch(`${BRAVE_DEBUG_URL}/json/new?${encodeURIComponent(LEADERBOARD_URL)}`, { method: 'PUT' });
+    lbPage = await createRes.json();
+  }
+
+  const cdp = await createCdpClient(lbPage.webSocketDebuggerUrl);
+
+  try {
+    await cdp.send('Page.enable');
+
+    const currentUrl = await evaluate(cdp.send, 'window.location.href');
+    if (!currentUrl || !currentUrl.includes('assignments/1038/leader-board')) {
+      await cdp.send('Page.navigate', { url: LEADERBOARD_URL });
+    } else {
+      await cdp.send('Page.reload');
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+
+    // Wait until leaderboard table rows are rendered
+    let ready = false;
+    for (let i = 0; i < 40; i++) {
+      try {
+        ready = await evaluate(cdp.send, `(() => {
+          const rows = document.querySelectorAll('tbody tr, table tr');
+          return rows.length > 10;
+        })()`);
+        if (ready) break;
+      } catch {}
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (!ready) {
+      console.warn('Leaderboard table did not finish rendering.');
+      return null;
+    }
+
+    const evalExpr = `(() => {
+      const rows = Array.from(document.querySelectorAll('tbody tr, table tr')).map(r => {
+        return Array.from(r.querySelectorAll('th, td')).map(c => c.innerText.trim());
+      }).filter(r => r.length >= 3 && /^\\d+$/.test(r[0]));
+
+      if (rows.length === 0) return null;
+
+      const highestNo = parseInt(rows[rows.length - 1][0], 10) || rows.length;
+      const targetRow = rows.find(r => r[1].toLowerCase() === ${JSON.stringify(accountName.toLowerCase())});
+
+      if (!targetRow) return { found: false, highestNo };
+
+      const no = parseInt(targetRow[0], 10);
+      const percentile = ((no / highestNo) * 100).toFixed(2);
+      return {
+        found: true,
+        no,
+        name: targetRow[1],
+        score: targetRow[2],
+        highestNo,
+        percentile: percentile + '%'
+      };
+    })()`;
+
+    let result = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        result = await evaluate(cdp.send, evalExpr);
+        if (result) break;
+      } catch {}
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    return result;
+  } catch (err) {
+    console.warn(`Failed to inspect leaderboard: ${err.message}`);
+    return null;
+  } finally {
+    cdp.close();
+  }
+}
+
 async function main() {
-  const { files, waitSeconds } = parseArgs();
+  const { files, waitSeconds, accountName } = parseArgs();
 
   console.log(`========================================`);
   console.log(`Omnicampus Batch Submission Runner`);
+  console.log(`Target account: ${accountName || '(none - leaderboard ranking skipped)'}`);
   console.log(`Found ${files.length} candidate file(s):`);
   files.forEach((f, idx) => console.log(`  ${idx + 1}. ${path.basename(f)}`));
   console.log(`Per-file wait window: ${waitSeconds}s`);
@@ -314,12 +501,41 @@ async function main() {
   console.log(`Connected to tab: ${target.title}`);
 
   const cdp = await createCdpClient(target.webSocketDebuggerUrl);
+  await ensurePageReady(cdp);
+
   const results = [];
 
   try {
     for (let i = 0; i < files.length; i++) {
       try {
         const res = await submitSingleFile(cdp, files[i], waitSeconds, i, files.length);
+
+        if (res.status === 'SUCCESS' || res.status === 'COMPLETED') {
+          if (accountName) {
+            console.log(`Querying leaderboard ranking for '${accountName}'...`);
+            const rankInfo = await getLeaderboardRanking(accountName);
+            if (rankInfo && rankInfo.found) {
+              res.rank = `${rankInfo.no}/${rankInfo.highestNo}`;
+              res.percentile = rankInfo.percentile;
+              console.log(`Leaderboard Standing: Rank ${rankInfo.no}/${rankInfo.highestNo} | Percentile: ${rankInfo.percentile} | Board Score: ${rankInfo.score}`);
+            } else if (rankInfo) {
+              res.rank = 'Not ranked';
+              res.percentile = 'N/A';
+              console.log(`Account '${accountName}' not found on leaderboard (Total entries: ${rankInfo.highestNo}).`);
+            } else {
+              res.rank = 'N/A';
+              res.percentile = 'N/A';
+            }
+          } else {
+            console.log(`Set your Account Name in the ${ENV_PATH} to get your ranking after a submission.`);
+            res.rank = 'N/A';
+            res.percentile = 'N/A';
+          }
+        } else {
+          res.rank = 'N/A';
+          res.percentile = 'N/A';
+        }
+
         results.push(res);
       } catch (err) {
         console.error(`[Error] Submission failed for ${path.basename(files[i])}:`, err.message);
@@ -328,6 +544,8 @@ async function main() {
           file: path.basename(files[i]),
           fullPath: files[i],
           score: 'ERROR',
+          rank: 'N/A',
+          percentile: 'N/A',
           timestamp: 'N/A',
           duration: '0s',
           status: 'ERROR'
@@ -341,30 +559,34 @@ async function main() {
     }
 
     // Print summary table
-    console.log('\n================================================================================');
+    console.log('\n========================================================================================================================');
     console.log(`BATCH SUBMISSION SUMMARY (Total: ${results.length})`);
-    console.log('================================================================================');
+    console.log('========================================================================================================================');
     console.log(
       '#'.padEnd(4) +
-      'File'.padEnd(35) +
-      'Score'.padEnd(12) +
+      'File'.padEnd(30) +
+      'Score'.padEnd(10) +
+      'Rank'.padEnd(14) +
+      'Percentile'.padEnd(14) +
       'Duration'.padEnd(10) +
       'Status'.padEnd(10) +
       'Timestamp'
     );
-    console.log('-'.repeat(80));
+    console.log('-'.repeat(120));
 
     for (const r of results) {
       console.log(
         String(r.index).padEnd(4) +
-        r.file.padEnd(35) +
-        String(r.score).padEnd(12) +
+        r.file.padEnd(30) +
+        String(r.score).padEnd(10) +
+        String(r.rank || 'N/A').padEnd(14) +
+        String(r.percentile || 'N/A').padEnd(14) +
         r.duration.padEnd(10) +
         r.status.padEnd(10) +
         r.timestamp
       );
     }
-    console.log('================================================================================');
+    console.log('========================================================================================================================');
 
     return results;
   } finally {
