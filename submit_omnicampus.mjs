@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -43,6 +44,152 @@ function loadEnv() {
   }
 }
 loadEnv();
+
+const QUEUE_DIR = process.env.OMNICAMPUS_QUEUE_DIR || path.join(os.tmpdir(), 'omnicampus_submit_queue');
+const LOCK_FILE = path.join(QUEUE_DIR, 'active.lock');
+const LOCK_TIMEOUT_MS = 180000; // 3 minutes timeout ceiling
+
+function isProcessAlive(pid) {
+  if (!pid || typeof pid !== 'number') return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+function ensureQueueDir() {
+  try {
+    fs.mkdirSync(QUEUE_DIR, { recursive: true });
+  } catch {}
+}
+
+function cleanStaleQueueItems() {
+  ensureQueueDir();
+
+  // Check active.lock
+  if (fs.existsSync(LOCK_FILE)) {
+    try {
+      const lockData = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
+      const isAlive = isProcessAlive(lockData.pid);
+      const isExpired = Date.now() - (lockData.acquiredAt || 0) > LOCK_TIMEOUT_MS;
+
+      if (!isAlive || isExpired) {
+        try { fs.unlinkSync(LOCK_FILE); } catch {}
+      }
+    } catch {
+      try { fs.unlinkSync(LOCK_FILE); } catch {}
+    }
+  }
+
+  // Check ticket files
+  try {
+    const files = fs.readdirSync(QUEUE_DIR).filter(f => f.endsWith('.ticket.json'));
+    for (const f of files) {
+      const p = path.join(QUEUE_DIR, f);
+      try {
+        const ticket = JSON.parse(fs.readFileSync(p, 'utf8'));
+        if (!isProcessAlive(ticket.pid) || (Date.now() - (ticket.createdAt || 0) > LOCK_TIMEOUT_MS)) {
+          try { fs.unlinkSync(p); } catch {}
+        }
+      } catch {
+        try { fs.unlinkSync(p); } catch {}
+      }
+    }
+  } catch {}
+}
+
+async function acquireQueueLock(fileTargets) {
+  ensureQueueDir();
+  cleanStaleQueueItems();
+
+  const ticketId = `${Date.now().toString().padStart(15, '0')}_${process.pid}_${Math.random().toString(36).slice(2, 6)}`;
+  const ticketPath = path.join(QUEUE_DIR, `${ticketId}.ticket.json`);
+
+  const ticketPayload = {
+    ticketId,
+    pid: process.pid,
+    createdAt: Date.now(),
+    files: fileTargets.map(f => path.basename(f))
+  };
+
+  fs.writeFileSync(ticketPath, JSON.stringify(ticketPayload), 'utf8');
+
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      if (fs.existsSync(ticketPath)) fs.unlinkSync(ticketPath);
+    } catch {}
+    try {
+      if (fs.existsSync(LOCK_FILE)) {
+        const lockData = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
+        if (lockData.pid === process.pid) {
+          fs.unlinkSync(LOCK_FILE);
+        }
+      }
+    } catch {}
+  };
+
+  const exitHandler = () => release();
+  process.on('exit', exitHandler);
+  process.on('SIGINT', () => { release(); process.exit(130); });
+  process.on('SIGTERM', () => { release(); process.exit(143); });
+
+  const waitStart = Date.now();
+  let lastLoggedPosition = -1;
+  let lastLogTime = 0;
+
+  while (true) {
+    cleanStaleQueueItems();
+
+    let tickets = [];
+    try {
+      tickets = fs.readdirSync(QUEUE_DIR)
+        .filter(f => f.endsWith('.ticket.json'))
+        .sort();
+    } catch {}
+
+    const myIndex = tickets.indexOf(`${ticketId}.ticket.json`);
+    const position = myIndex !== -1 ? myIndex + 1 : 1;
+    const total = Math.max(tickets.length, 1);
+
+    if (position === 1) {
+      let acquired = false;
+      try {
+        const fd = fs.openSync(LOCK_FILE, 'wx');
+        fs.writeFileSync(fd, JSON.stringify({
+          pid: process.pid,
+          ticketId,
+          acquiredAt: Date.now()
+        }), 'utf8');
+        fs.closeSync(fd);
+        acquired = true;
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      }
+
+      if (acquired) {
+        if (Date.now() - waitStart > 1500) {
+          console.log(`[Queue] Turn acquired. Proceeding to submission...`);
+        }
+        return { release };
+      }
+    }
+
+    const now = Date.now();
+    const waitedSec = Math.round((now - waitStart) / 1000);
+    if (position !== lastLoggedPosition || (now - lastLogTime >= 10000)) {
+      console.log(`[Queue] Position ${position}/${total}. Waiting for turn (waited ${waitedSec}s)...`);
+      lastLoggedPosition = position;
+      lastLogTime = now;
+    }
+
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
 
 function resolveInputFiles(targets) {
   const resolved = [];
@@ -244,10 +391,14 @@ async function submitSingleFile(cdp, filePath, waitSeconds, batchIdx, totalFiles
   console.log(`\n[${batchIdx + 1}/${totalFiles}] Submitting: ${fileBase} (${filePath})`);
 
   // Wait if previous scoring is still active
+  let prevWaitLogged = false;
   for (let i = 0; i < 30; i++) {
     const status = await getDomStatus(cdp.send);
     if (!status?.isScoring) break;
-    process.stdout.write(`\rPrevious scoring still in progress, waiting 1s...`);
+    if (!prevWaitLogged) {
+      console.log('Previous scoring still in progress, waiting for completion...');
+      prevWaitLogged = true;
+    }
     await new Promise(r => setTimeout(r, 1000));
   }
 
@@ -299,13 +450,14 @@ async function submitSingleFile(cdp, filePath, waitSeconds, batchIdx, totalFiles
     throw new Error(`Failed to click Submit button for ${fileBase}.`);
   }
 
-  console.log(`Dispatched. Polling for scoring completion (up to ${waitSeconds}s)...`);
+  console.log(`Dispatched. Probing for score every 1s...`);
 
   const startTime = Date.now();
   const maxWaitMs = waitSeconds * 1000;
   let finalScore = null;
   let finalTimestamp = null;
   let submissionStatus = 'TIMEOUT';
+  let reportedScoring = false;
 
   while (Date.now() - startTime < maxWaitMs) {
     await new Promise(r => setTimeout(r, 1000));
@@ -320,17 +472,16 @@ async function submitSingleFile(cdp, filePath, waitSeconds, batchIdx, totalFiles
         finalScore = curr.score;
         finalTimestamp = curr.scoredTime;
         submissionStatus = 'SUCCESS';
-        process.stdout.write(`\r[+${elapsed}s] Scored: ${finalScore} (${finalTimestamp})\n`);
+        console.log(`Scored: ${finalScore} (${finalTimestamp}) in ${elapsed}s`);
         break;
-      } else if (curr.submittedTime) {
-        process.stdout.write(`\r[+${elapsed}s] Scoring in progress (${curr.submittedTime})...`);
-      } else {
-        process.stdout.write(`\r[+${elapsed}s] Waiting for score...`);
+      } else if (curr.submittedTime || curr.isScoring) {
+        if (!reportedScoring) {
+          console.log(`Scoring in progress, probing every 1s...`);
+          reportedScoring = true;
+        }
       }
     }
   }
-
-  process.stdout.write('\n');
 
   // Fallback read
   if (!finalScore || submissionStatus === 'TIMEOUT') {
@@ -496,16 +647,20 @@ async function main() {
   console.log(`Per-file wait window: ${waitSeconds}s`);
   console.log(`========================================`);
 
-  console.log('Connecting to Brave debugging session on port 9222...');
-  const target = await getBraveTarget();
-  console.log(`Connected to tab: ${target.title}`);
+  await ensureBraveReady();
 
-  const cdp = await createCdpClient(target.webSocketDebuggerUrl);
-  await ensurePageReady(cdp);
-
-  const results = [];
+  const queueLease = await acquireQueueLock(files);
+  let cdp = null;
 
   try {
+    console.log('Connecting to Brave debugging session on port 9222...');
+    const target = await getBraveTarget();
+    console.log(`Connected to tab: ${target.title}`);
+
+    cdp = await createCdpClient(target.webSocketDebuggerUrl);
+    await ensurePageReady(cdp);
+
+    const results = [];
     for (let i = 0; i < files.length; i++) {
       try {
         const res = await submitSingleFile(cdp, files[i], waitSeconds, i, files.length);
@@ -590,7 +745,10 @@ async function main() {
 
     return results;
   } finally {
-    cdp.close();
+    if (cdp) {
+      try { cdp.close(); } catch {}
+    }
+    queueLease.release();
   }
 }
 

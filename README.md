@@ -55,16 +55,25 @@ If neither `OMNICAMPUS_ACCOUNT_NAME` nor `--account` is set, leaderboard lookups
 Set your Account Name in the <.env path> to get your ranking after a submission.
 ```
 
+### Cross-Process Submission Queue
+
+When multiple subagents or terminal sessions invoke `submit_omnicampus.mjs` concurrently on the same machine, they coordinate through an atomic file-based FIFO queue located at `os.tmpdir()/omnicampus_submit_queue`:
+- **Deterministic FIFO Order**: Each process creates a timestamped ticket and waits its turn.
+- **Deadlock Prevention**: Automatically detects dead/crashed processes (`process.kill(pid, 0)`) and purges orphaned locks or stale tickets.
+- **Token-Saving Progress**: Waiting processes log position updates at low frequency (every 10s or upon position change) to avoid context flooding.
+
 ### Flow
 
-1. Connects to Brave via debugging port 9222.
-2. Locates an existing Omnicampus tab or creates a new one, navigates to the assignment 1038 submission URL if on another page, and waits until the upload interface is fully rendered.
-3. For each candidate file in the batch:
-   - Waits if a previous submission is still scoring (polls every 1s).
+1. Checks Brave debugging port 9222 readiness.
+2. Acquires machine-wide queue lock (waits in FIFO order if another submission is running).
+3. Connects to Brave, locates an existing Omnicampus tab or creates a new one, and waits until the upload interface is fully rendered.
+4. For each candidate file in the batch:
+   - Waits if a previous submission is still scoring.
    - Injects the file into `<input type="file">` via Chrome DevTools Protocol (`DOM.setFileInputFiles`).
-   - Waits for the `Submit` button to enable in React.
-   - Triggers click on `Submit`.
-   - Polls DOM status every 1s until `Scoring Success` is detected, capturing score and timestamp immediately upon completion (or timing out if `--wait` limit is reached).
+   - Waits for the `Submit` button to enable in React and clicks Submit.
+   - Emits compact token-saving status transitions (`Probing for score every 1s...`, `Scoring in progress, probing every 1s...`) without 1-second repeated line spam.
+   - Captures score and timestamp immediately upon `Scoring Success`.
    - If an account name is configured, queries the leaderboard page via a dedicated tab to extract Rank, Total participants, and calculates percentile `(Rank / Highest) * 100` (%). If not configured, prints the instructional notice and skips leaderboard navigation.
    - Pauses brief settle time before the next candidate.
-4. Prints a structured batch summary table with scores, ranks, percentiles, timestamps, and durations.
+5. Releases the machine-wide queue lock in `finally`, immediately granting access to the next waiting process.
+6. Prints a structured batch summary table with scores, ranks, percentiles, timestamps, and durations.
