@@ -1,79 +1,175 @@
-# Developer Utilities (`.devutil/`)
+# Omnicampus Auto Submit (`omnicampus-auto-submit`)
 
-## Omnicampus Submission Utility (`submit_omnicampus.mjs`)
+Autonomous batch submission, score extraction, and leaderboard ranking runner for [Omnicampus](https://edu.omnicamp.us) assignments via the Chrome DevTools Protocol (CDP).
 
-Automated submission and score extraction runner for Omnicampus course assignment 1038 via Brave Remote Debugging Protocol (port 9222). Supports single files and sequential batch submissions.
+Supports **Brave**, **Google Chrome**, **Microsoft Edge**, and **Chromium** with zero npm dependencies (pure native Node.js 22+).
 
-### Prerequisites
+---
 
-- Node.js 22+ (uses native `WebSocket` and `fetch`, zero npm dependencies required).
-- Brave browser running with remote debugging enabled:
+## Features
+
+- **Zero NPM Dependencies**: Built 100% on native Node.js (`WebSocket`, `fetch`, `process.loadEnvFile`).
+- **Multi-Browser Support**: Connects seamlessly to Brave, Chrome, Microsoft Edge, or Chromium via remote debugging.
+- **Batch Submission**: Accepts single files, lists of files, directories, or glob patterns (e.g. `"candidates/*.csv"`).
+- **Fast 1s Polling with Early Exit**: Polls DOM status every second and captures scores immediately upon completion without unnecessary waiting.
+- **Token-Saving Progress Logging**: Emits clean state transitions instead of spamming stdout, making it ideal for LLM coding agents and subagents.
+- **Cross-Process FIFO Queue**: Multiple terminals or autonomous subagents coordinate safely through an atomic file-based FIFO lock with automatic dead-process eviction.
+- **Automated Leaderboard Standing**: Automatically opens/reloads the assignment leaderboard, extracts your rank ("No"), total participant count, and calculates your percentile (`(Rank / Highest) * 100%`).
+
+---
+
+## Prerequisites
+
+- **Node.js 22.0.0 or higher** (uses native `WebSocket` and `fetch`).
+- A Chromium-based browser logged into your Omnicampus account, started with `--remote-debugging-port=9222`.
+
+### Starting Your Browser with Remote Debugging
+
+Close existing instances of your target browser (or ensure background apps are closed), then launch from your terminal:
+
+#### Brave
+- **Windows**:
   ```powershell
-  node D:\Projects\myskills\productivity\brave-browsing\scripts\ensure-brave.js
+  brave.exe --remote-debugging-port=9222 --remote-allow-origins=*
   ```
-  or manual launch:
+- **macOS**:
+  ```bash
+  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --remote-debugging-port=9222
+  ```
+- **Linux**:
+  ```bash
+  brave-browser --remote-debugging-port=9222
+  ```
+
+#### Google Chrome
+- **Windows**:
   ```powershell
-  brave.exe --remote-debugging-port=9222 --remote-allow-origins=http://127.0.0.1:9222,http://localhost:9222
+  chrome.exe --remote-debugging-port=9222 --remote-allow-origins=*
   ```
-- Omnicampus account logged in inside Brave (tab will auto-open/navigate if not already on the submission page).
+- **macOS**:
+  ```bash
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222
+  ```
+- **Linux**:
+  ```bash
+  google-chrome --remote-debugging-port=9222
+  ```
 
-### Usage
+#### Microsoft Edge
+- **Windows**:
+  ```powershell
+  msedge.exe --remote-debugging-port=9222 --remote-allow-origins=*
+  ```
+- **macOS**:
+  ```bash
+  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" --remote-debugging-port=9222
+  ```
+- **Linux**:
+  ```bash
+  microsoft-edge --remote-debugging-port=9222
+  ```
 
-#### Single File
-```powershell
-node .devutil/submit_omnicampus.mjs Competition/submission.csv
+---
+
+## Quick Start
+
+### 1. Configuration (`.env`)
+
+Copy `.env.example` to `.env`:
+
+```bash
+cp .env.example .env
 ```
 
-#### Multiple Files / Batch
-```powershell
-# Pass multiple files directly
-node .devutil/submit_omnicampus.mjs file1.csv file2.csv file3.csv
-
-# Pass a directory containing .csv files
-node .devutil/submit_omnicampus.mjs candidates_dir/
-
-# Pass wildcard / glob patterns
-node .devutil/submit_omnicampus.mjs "candidates/*.csv"
-
-# Custom per-submission timeout ceiling (default 60s)
-node .devutil/submit_omnicampus.mjs "candidates/*.csv" --wait 45
-
-# Override or specify account name via CLI
-node .devutil/submit_omnicampus.mjs Competition/submission.csv --account myAccount
-```
-
-### Configuration (`.env`)
-
-To automatically fetch your leaderboard standing and percentile after submission without passing CLI arguments, define your account name in `.env`:
+Configure your settings:
 
 ```env
-OMNICAMPUS_ACCOUNT_NAME=yourAccountName
+# Target browser: brave | chrome | edge | chromium
+BROWSER=brave
+
+# CDP port and host (default: 9222)
+CDP_PORT=9222
+CDP_HOST=127.0.0.1
+
+# Omnicampus assignment configuration
+OMNICAMPUS_COURSE_ID=170
+OMNICAMPUS_ASSIGNMENT_ID=1038
+
+# Optional: Set your Account Name for automatic ranking & percentile extraction
+OMNICAMPUS_ACCOUNT_NAME=your_account_name
 ```
 
-If neither `OMNICAMPUS_ACCOUNT_NAME` nor `--account` is set, leaderboard lookups are skipped and the runner outputs:
+> **Note**: If `OMNICAMPUS_ACCOUNT_NAME` is omitted, leaderboard navigation is skipped, and the runner outputs a reminder notice.
+
+---
+
+### 2. Usage
+
+#### Submit a Single File
+```bash
+node submit_omnicampus.mjs submission.csv
+```
+
+#### Submit Multiple Files in Batch
+```bash
+# Explicit file list
+node submit_omnicampus.mjs model_1.csv model_2.csv model_3.csv
+
+# Directory of .csv files
+node submit_omnicampus.mjs candidates_dir/
+
+# Wildcard / Glob pattern
+node submit_omnicampus.mjs "candidates/*.csv"
+```
+
+#### CLI Options & Overrides
+```bash
+# Specify target browser via CLI
+node submit_omnicampus.mjs submission.csv --browser chrome
+
+# Custom CDP port
+node submit_omnicampus.mjs submission.csv --port 9223
+
+# Set scoring timeout ceiling per file (default 60s)
+node submit_omnicampus.mjs "candidates/*.csv" --wait 45
+
+# Override account name via CLI
+node submit_omnicampus.mjs submission.csv --account myAccountName
+
+# Temporarily skip leaderboard lookup
+node submit_omnicampus.mjs submission.csv --no-account
+```
+
+---
+
+## Execution Flow
+
 ```text
-Set your Account Name in the <.env path> to get your ranking after a submission.
+1. Check Browser CDP endpoint (e.g. http://127.0.0.1:9222/json/version)
+2. Acquire Cross-Process FIFO Queue lock (waits if another runner is active)
+3. Locate existing Omnicampus tab or open target assignment URL
+4. For each file in batch:
+   ├── Inject .csv into file input via CDP (DOM.setFileInputFiles)
+   ├── Wait for Submit button to enable and trigger click
+   ├── Poll DOM every 1s for "Scoring Success"
+   ├── Capture score and timestamp immediately upon completion
+   ├── If account name configured: query leaderboard tab, calculate rank & percentile
+   └── Settle delay (2s) before next candidate
+5. Release Queue lock (allows next waiting process in line to proceed)
+6. Output structured batch summary table
 ```
 
-### Cross-Process Submission Queue
+---
 
-When multiple subagents or terminal sessions invoke `submit_omnicampus.mjs` concurrently on the same machine, they coordinate through an atomic file-based FIFO queue located at `os.tmpdir()/omnicampus_submit_queue`:
-- **Deterministic FIFO Order**: Each process creates a timestamped ticket and waits its turn.
-- **Deadlock Prevention**: Automatically detects dead/crashed processes (`process.kill(pid, 0)`) and purges orphaned locks or stale tickets.
-- **Token-Saving Progress**: Waiting processes log position updates at low frequency (every 10s or upon position change) to avoid context flooding.
+## Cross-Process Queue Architecture
 
-### Flow
+When multiple subagents, automated pipelines, or terminal tabs invoke `submit_omnicampus.mjs` concurrently, they coordinate through a machine-wide atomic FIFO queue stored at `os.tmpdir()/omnicampus_submit_queue`:
+- **Strict FIFO Ordering**: Requests are served in order of arrival.
+- **Deadlock Prevention**: Automatically detects terminated/crashed processes using OS-level signal inspection (`process.kill(pid, 0)`) and purges stale lock files (180s ceiling).
+- **Token Efficiency**: Waiting processes log progress conservatively (every 10 seconds or on position change) to avoid context flooding.
 
-1. Checks Brave debugging port 9222 readiness.
-2. Acquires machine-wide queue lock (waits in FIFO order if another submission is running).
-3. Connects to Brave, locates an existing Omnicampus tab or creates a new one, and waits until the upload interface is fully rendered.
-4. For each candidate file in the batch:
-   - Waits if a previous submission is still scoring.
-   - Injects the file into `<input type="file">` via Chrome DevTools Protocol (`DOM.setFileInputFiles`).
-   - Waits for the `Submit` button to enable in React and clicks Submit.
-   - Emits compact token-saving status transitions (`Probing for score every 1s...`, `Scoring in progress, probing every 1s...`) without 1-second repeated line spam.
-   - Captures score and timestamp immediately upon `Scoring Success`.
-   - If an account name is configured, queries the leaderboard page via a dedicated tab to extract Rank, Total participants, and calculates percentile `(Rank / Highest) * 100` (%). If not configured, prints the instructional notice and skips leaderboard navigation.
-   - Pauses brief settle time before the next candidate.
-5. Releases the machine-wide queue lock in `finally`, immediately granting access to the next waiting process.
-6. Prints a structured batch summary table with scores, ranks, percentiles, timestamps, and durations.
+---
+
+## License
+
+MIT License. Copyright (c) 2026 loerei.

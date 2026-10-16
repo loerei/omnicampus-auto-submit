@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -5,32 +7,26 @@ import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Omnicampus Submission & Score Automation (Batch Supported)
+ * Omnicampus Submission & Score Automation (Multi-Browser & Batch Supported)
  * Automates uploading one or more submission .csv files to Omnicampus and extracting scores
- * sequentially via Brave Remote Debugging Protocol (port 9222).
+ * sequentially via Chrome DevTools Protocol (CDP) on Brave, Chrome, Edge, or Chromium.
  *
  * Usage:
- *   node .devutil/submit_omnicampus.mjs <file_or_dir_or_glob...> [--wait <seconds>]
+ *   node submit_omnicampus.mjs <file_or_dir_or_glob...> [--wait <seconds>] [--account <name>] [--browser <name>] [--port <number>]
  *
  * Examples:
- *   node .devutil/submit_omnicampus.mjs Competition/submission.csv
- *   node .devutil/submit_omnicampus.mjs model_a.csv model_b.csv model_c.csv
- *   node .devutil/submit_omnicampus.mjs "candidates/*.csv" --wait 60
- *   node .devutil/submit_omnicampus.mjs candidates_dir/
+ *   node submit_omnicampus.mjs submission.csv
+ *   node submit_omnicampus.mjs model_a.csv model_b.csv model_c.csv
+ *   node submit_omnicampus.mjs "candidates/*.csv" --wait 60
+ *   node submit_omnicampus.mjs candidates_dir/ --browser chrome --port 9222
  */
-
-const ASSIGNMENT_URL = 'https://edu.omnicamp.us/en/courses/170/assignments/1038/';
-const LEADERBOARD_URL = 'https://edu.omnicamp.us/en/courses/170/assignments/1038/leader-board/';
-const BRAVE_DEBUG_URL = 'http://127.0.0.1:9222';
-const DEFAULT_WAIT_SECONDS = 60;
-const SETTLE_DELAY_MS = 2000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 const ENV_PATH = fs.existsSync(path.resolve('.env'))
   ? path.resolve('.env')
-  : path.resolve(REPO_ROOT, '.env');
+  : (fs.existsSync(path.resolve(REPO_ROOT, '.env')) ? path.resolve(REPO_ROOT, '.env') : path.resolve('.env'));
 
 function loadEnv() {
   if (typeof process.loadEnvFile === 'function') {
@@ -44,6 +40,19 @@ function loadEnv() {
   }
 }
 loadEnv();
+
+const BASE_URL = process.env.OMNICAMPUS_BASE_URL || 'https://edu.omnicamp.us';
+const COURSE_ID = process.env.OMNICAMPUS_COURSE_ID || '170';
+const ASSIGNMENT_ID = process.env.OMNICAMPUS_ASSIGNMENT_ID || '1038';
+
+const ASSIGNMENT_URL = `${BASE_URL}/en/courses/${COURSE_ID}/assignments/${ASSIGNMENT_ID}/`;
+const LEADERBOARD_URL = `${BASE_URL}/en/courses/${COURSE_ID}/assignments/${ASSIGNMENT_ID}/leader-board/`;
+
+const DEFAULT_BROWSER = (process.env.BROWSER || process.env.OMNICAMPUS_BROWSER || 'brave').toLowerCase();
+const DEFAULT_CDP_HOST = process.env.CDP_HOST || '127.0.0.1';
+const DEFAULT_CDP_PORT = parseInt(process.env.CDP_PORT || process.env.PORT || '9222', 10);
+const DEFAULT_WAIT_SECONDS = 60;
+const SETTLE_DELAY_MS = 2000;
 
 const QUEUE_DIR = process.env.OMNICAMPUS_QUEUE_DIR || path.join(os.tmpdir(), 'omnicampus_submit_queue');
 const LOCK_FILE = path.join(QUEUE_DIR, 'active.lock');
@@ -234,6 +243,9 @@ function parseArgs() {
   const targets = [];
   let waitSeconds = DEFAULT_WAIT_SECONDS;
   let accountName = process.env.OMNICAMPUS_ACCOUNT_NAME || process.env.ACCOUNT_NAME || null;
+  let browser = DEFAULT_BROWSER;
+  let cdpHost = DEFAULT_CDP_HOST;
+  let cdpPort = DEFAULT_CDP_PORT;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--wait' && i + 1 < args.length) {
@@ -244,13 +256,22 @@ function parseArgs() {
     } else if (args[i] === '--account' && i + 1 < args.length) {
       accountName = args[i + 1].trim() || null;
       i++;
+    } else if (args[i] === '--browser' && i + 1 < args.length) {
+      browser = args[i + 1].toLowerCase().trim();
+      i++;
+    } else if (args[i] === '--port' && i + 1 < args.length) {
+      cdpPort = parseInt(args[i + 1], 10) || DEFAULT_CDP_PORT;
+      i++;
+    } else if (args[i] === '--host' && i + 1 < args.length) {
+      cdpHost = args[i + 1].trim();
+      i++;
     } else if (!args[i].startsWith('--')) {
       targets.push(args[i]);
     }
   }
 
   if (targets.length === 0) {
-    console.error('Usage: node .devutil/submit_omnicampus.mjs <file_or_dir_or_glob...> [--wait 60] [--account <name>]');
+    console.error('Usage: node submit_omnicampus.mjs <file_or_dir_or_glob...> [--wait 60] [--account <name>] [--browser <brave|chrome|edge>] [--port <number>]');
     process.exit(1);
   }
 
@@ -261,62 +282,90 @@ function parseArgs() {
     process.exit(1);
   }
 
-  return { files, waitSeconds, accountName };
+  const cdpUrl = `http://${cdpHost}:${cdpPort}`;
+  return { files, waitSeconds, accountName, browser, cdpHost, cdpPort, cdpUrl };
 }
 
-async function ensureBraveReady() {
+function getBrowserLaunchCommand(browser, port) {
+  const b = browser.toLowerCase();
+  const isWin = process.platform === 'win32';
+  const isMac = process.platform === 'darwin';
+
+  if (b.includes('edge')) {
+    if (isWin) return `msedge.exe --remote-debugging-port=${port} --remote-allow-origins=*`;
+    if (isMac) return `"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" --remote-debugging-port=${port} --remote-allow-origins=*`;
+    return `microsoft-edge --remote-debugging-port=${port} --remote-allow-origins=*`;
+  }
+  if (b.includes('chrome')) {
+    if (isWin) return `chrome.exe --remote-debugging-port=${port} --remote-allow-origins=*`;
+    if (isMac) return `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=${port} --remote-allow-origins=*`;
+    return `google-chrome --remote-debugging-port=${port} --remote-allow-origins=*`;
+  }
+  // Default to Brave
+  if (isWin) return `brave.exe --remote-debugging-port=${port} --remote-allow-origins=*`;
+  if (isMac) return `"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --remote-debugging-port=${port} --remote-allow-origins=*`;
+  return `brave-browser --remote-debugging-port=${port} --remote-allow-origins=*`;
+}
+
+async function ensureBrowserReady(browser, cdpUrl, cdpPort) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await fetch(`${BRAVE_DEBUG_URL}/json/version`, { signal: AbortSignal.timeout(1500) });
-      if (res.ok) return true;
+      const res = await fetch(`${cdpUrl}/json/version`, { signal: AbortSignal.timeout(1500) });
+      if (res.ok) {
+        const info = await res.json();
+        return { ok: true, info };
+      }
     } catch {}
 
-    if (attempt === 0) {
-      console.log('Brave port 9222 not reachable, running connection helper...');
+    if (attempt === 0 && browser.includes('brave')) {
       try {
         const helperPath = path.resolve('..', 'myskills', 'productivity', 'brave-browsing', 'scripts', 'ensure-brave.js');
         if (fs.existsSync(helperPath)) {
           execSync(`node "${helperPath}"`, { stdio: 'pipe' });
         }
-      } catch (e) {
-        // ignore
-      }
+      } catch {}
     }
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 1000));
   }
-  return false;
+  return { ok: false };
 }
 
-async function getBraveTarget() {
-  const isReady = await ensureBraveReady();
-  if (!isReady) {
-    throw new Error(`Failed to connect to Brave on ${BRAVE_DEBUG_URL}. Ensure Brave is running with --remote-debugging-port=9222.`);
+async function getBrowserTarget(browser, cdpUrl, cdpPort) {
+  const ready = await ensureBrowserReady(browser, cdpUrl, cdpPort);
+  if (!ready.ok) {
+    const launchCmd = getBrowserLaunchCommand(browser, cdpPort);
+    throw new Error(
+      `Cannot connect to ${browser} on ${cdpUrl}.\n` +
+      `Please ensure ${browser} is running with remote debugging enabled:\n\n` +
+      `  ${launchCmd}\n`
+    );
   }
 
   let pages;
   try {
-    const res = await fetch(`${BRAVE_DEBUG_URL}/json`);
+    const res = await fetch(`${cdpUrl}/json`);
     pages = await res.json();
   } catch (err) {
-    throw new Error(`Failed to fetch page list from Brave on ${BRAVE_DEBUG_URL}: ${err.message}`);
+    throw new Error(`Failed to fetch page list from ${browser} on ${cdpUrl}: ${err.message}`);
   }
 
-  // 1. Exact match on assignment 1038 submission page (exclude leaderboard subroute)
-  let omniPage = pages.find(p => p.type === 'page' && p.url && p.url.includes('assignments/1038') && !p.url.includes('/leader-board/'));
+  // 1. Exact match on target assignment submission page (excluding leaderboard)
+  const targetSubroute = `assignments/${ASSIGNMENT_ID}`;
+  let omniPage = pages.find(p => p.type === 'page' && p.url && p.url.includes(targetSubroute) && !p.url.includes('/leader-board/'));
 
   // 2. Fallback to any Omnicampus tab to repurpose and navigate
   if (!omniPage) {
-    omniPage = pages.find(p => p.type === 'page' && p.url && p.url.includes('edu.omnicamp.us'));
+    omniPage = pages.find(p => p.type === 'page' && p.url && p.url.includes('omnicamp.us'));
   }
 
   // 3. Create a new tab if no Omnicampus tab is found
   if (!omniPage) {
-    console.log('No Omnicampus tab found in Brave, creating new tab...');
-    const createRes = await fetch(`${BRAVE_DEBUG_URL}/json/new?${encodeURIComponent(ASSIGNMENT_URL)}`, { method: 'PUT' });
+    console.log(`No Omnicampus tab found in ${browser}, creating new tab...`);
+    const createRes = await fetch(`${cdpUrl}/json/new?${encodeURIComponent(ASSIGNMENT_URL)}`, { method: 'PUT' });
     omniPage = await createRes.json();
   }
 
-  return omniPage;
+  return { target: omniPage, browserInfo: ready.info };
 }
 
 function createCdpClient(wsUrl) {
@@ -330,11 +379,14 @@ function createCdpClient(wsUrl) {
       if (data.id && pending.has(data.id)) {
         const { resolve, reject } = pending.get(data.id);
         pending.delete(data.id);
-        if (data.error) reject(new Error(data.error.message || JSON.stringify(data.error)));
-        else resolve(data.result);
+        if (data.error) {
+          reject(new Error(`CDP error ${data.error.code}: ${data.error.message}`));
+        } else {
+          resolve(data.result);
+        }
       }
-    } catch (e) {
-      console.warn('Failed to parse CDP message:', e);
+    } catch (err) {
+      // Ignore unparseable message
     }
   };
 
@@ -365,6 +417,37 @@ async function evaluate(send, expression) {
     awaitPromise: true
   });
   return res && res.result ? res.result.value : null;
+}
+
+async function ensurePageReady(cdp) {
+  await cdp.send('Page.enable');
+
+  // Verify URL and navigate if on the wrong route
+  const currentUrl = await evaluate(cdp.send, 'window.location.href');
+  const targetSubroute = `assignments/${ASSIGNMENT_ID}`;
+  if (!currentUrl || !currentUrl.includes(targetSubroute) || currentUrl.includes('/leader-board/')) {
+    console.log(`Navigating tab to Omnicampus assignment URL (${ASSIGNMENT_URL})...`);
+    await cdp.send('Page.navigate', { url: ASSIGNMENT_URL });
+  }
+
+  // Poll until submission interface is mounted
+  console.log('Waiting for Omnicampus submission interface to load...');
+  let ready = false;
+  for (let i = 0; i < 30; i++) {
+    ready = await evaluate(cdp.send, `(() => {
+      const fileInput = document.querySelector('input[type="file"]');
+      const submitBtn = Array.from(document.querySelectorAll('button')).some(b => b.innerText.trim() === 'Submit');
+      return !!fileInput && submitBtn;
+    })()`);
+    if (ready) break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  if (!ready) {
+    throw new Error('Omnicampus page loaded, but submission controls were not found. Ensure you are logged into Omnicampus in your browser.');
+  }
+
+  console.log('Omnicampus submission interface is ready.');
 }
 
 async function getDomStatus(send) {
@@ -513,52 +596,23 @@ async function submitSingleFile(cdp, filePath, waitSeconds, batchIdx, totalFiles
   };
 }
 
-async function ensurePageReady(cdp) {
-  await cdp.send('Page.enable');
-
-  const currentUrl = await evaluate(cdp.send, 'window.location.href');
-  const isExactAssignmentPage = currentUrl && currentUrl.includes('assignments/1038') && !currentUrl.includes('/leader-board/');
-
-  if (!isExactAssignmentPage) {
-    console.log(`Current page is ${currentUrl || 'unknown'}. Navigating to ${ASSIGNMENT_URL}...`);
-    await cdp.send('Page.navigate', { url: ASSIGNMENT_URL });
-  }
-
-  console.log('Waiting for Omnicampus submission interface to load...');
-  let ready = false;
-  for (let i = 0; i < 40; i++) {
-    ready = await evaluate(cdp.send, `(() => {
-      const fileInput = document.querySelector('input[type="file"]');
-      const submitBtn = Array.from(document.querySelectorAll('button')).some(b => b.innerText.includes('Submit'));
-      return !!fileInput && submitBtn;
-    })()`);
-    if (ready) break;
-    await new Promise(r => setTimeout(r, 500));
-  }
-
-  if (!ready) {
-    throw new Error('Omnicampus page loaded, but submission controls were not found. Ensure you are logged into Omnicampus in Brave.');
-  }
-
-  console.log('Omnicampus submission interface is ready.');
-}
-
-async function getLeaderboardRanking(accountName) {
+async function getLeaderboardRanking(accountName, cdpUrl, browser) {
   if (!accountName) return null;
 
   let pages;
   try {
-    const res = await fetch(`${BRAVE_DEBUG_URL}/json`);
+    const res = await fetch(`${cdpUrl}/json`);
     pages = await res.json();
   } catch {
     return null;
   }
 
-  let lbPage = pages.find(p => p.type === 'page' && p.url && p.url.includes('assignments/1038/leader-board'));
+  const targetSubroute = `assignments/${ASSIGNMENT_ID}/leader-board`;
+  let lbPage = pages.find(p => p.type === 'page' && p.url && p.url.includes(targetSubroute));
 
   if (!lbPage) {
-    console.log('Opening Omnicampus leaderboard tab in Brave...');
-    const createRes = await fetch(`${BRAVE_DEBUG_URL}/json/new?${encodeURIComponent(LEADERBOARD_URL)}`, { method: 'PUT' });
+    console.log(`Opening Omnicampus leaderboard tab in ${browser}...`);
+    const createRes = await fetch(`${cdpUrl}/json/new?${encodeURIComponent(LEADERBOARD_URL)}`, { method: 'PUT' });
     lbPage = await createRes.json();
   }
 
@@ -568,7 +622,7 @@ async function getLeaderboardRanking(accountName) {
     await cdp.send('Page.enable');
 
     const currentUrl = await evaluate(cdp.send, 'window.location.href');
-    if (!currentUrl || !currentUrl.includes('assignments/1038/leader-board')) {
+    if (!currentUrl || !currentUrl.includes(targetSubroute)) {
       await cdp.send('Page.navigate', { url: LEADERBOARD_URL });
     } else {
       await cdp.send('Page.reload');
@@ -637,25 +691,35 @@ async function getLeaderboardRanking(accountName) {
 }
 
 async function main() {
-  const { files, waitSeconds, accountName } = parseArgs();
+  const { files, waitSeconds, accountName, browser, cdpPort, cdpUrl } = parseArgs();
 
   console.log(`========================================`);
   console.log(`Omnicampus Batch Submission Runner`);
+  console.log(`Browser target: ${browser} (${cdpUrl})`);
   console.log(`Target account: ${accountName || '(none - leaderboard ranking skipped)'}`);
+  console.log(`Assignment URL: ${ASSIGNMENT_URL}`);
   console.log(`Found ${files.length} candidate file(s):`);
   files.forEach((f, idx) => console.log(`  ${idx + 1}. ${path.basename(f)}`));
   console.log(`Per-file wait window: ${waitSeconds}s`);
   console.log(`========================================`);
 
-  await ensureBraveReady();
+  const initialCheck = await ensureBrowserReady(browser, cdpUrl, cdpPort);
+  if (!initialCheck.ok) {
+    const launchCmd = getBrowserLaunchCommand(browser, cdpPort);
+    throw new Error(
+      `Cannot connect to ${browser} on ${cdpUrl}.\n` +
+      `Please ensure ${browser} is running with remote debugging enabled:\n\n` +
+      `  ${launchCmd}\n`
+    );
+  }
 
   const queueLease = await acquireQueueLock(files);
   let cdp = null;
 
   try {
-    console.log('Connecting to Brave debugging session on port 9222...');
-    const target = await getBraveTarget();
-    console.log(`Connected to tab: ${target.title}`);
+    console.log(`Connecting to ${browser} debugging session on ${cdpUrl}...`);
+    const { target, browserInfo } = await getBrowserTarget(browser, cdpUrl, cdpPort);
+    console.log(`Connected to tab: ${target.title} (${browserInfo?.Browser || browser})`);
 
     cdp = await createCdpClient(target.webSocketDebuggerUrl);
     await ensurePageReady(cdp);
@@ -668,7 +732,7 @@ async function main() {
         if (res.status === 'SUCCESS' || res.status === 'COMPLETED') {
           if (accountName) {
             console.log(`Querying leaderboard ranking for '${accountName}'...`);
-            const rankInfo = await getLeaderboardRanking(accountName);
+            const rankInfo = await getLeaderboardRanking(accountName, cdpUrl, browser);
             if (rankInfo && rankInfo.found) {
               res.rank = `${rankInfo.no}/${rankInfo.highestNo}`;
               res.percentile = rankInfo.percentile;

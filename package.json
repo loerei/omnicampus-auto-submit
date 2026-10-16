@@ -1,0 +1,29 @@
+{
+  "name": "omnicampus-auto-submit",
+  "version": "1.0.0",
+  "description": "Autonomous batch submission, score extraction, and leaderboard ranking runner for Omnicampus via Chrome DevTools Protocol (CDP)",
+  "type": "module",
+  "main": "submit_omnicampus.mjs",
+  "bin": {
+    "omnicampus-submit": "./submit_omnicampus.mjs"
+  },
+  "scripts": {
+    "start": "node submit_omnicampus.mjs"
+  },
+  "keywords": [
+    "omnicampus",
+    "automation",
+    "cdp",
+    "chrome-devtools-protocol",
+    "brave",
+    "chrome",
+    "edge",
+    "leaderboard",
+    "machine-learning"
+  ],
+  "author": "loerei",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
