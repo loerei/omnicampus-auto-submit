@@ -8,13 +8,9 @@ Supports **Brave**, **Google Chrome**, **Microsoft Edge**, and **Chromium** with
 
 ## Features
 
-- **Zero NPM Dependencies**: Built 100% on native Node.js (`WebSocket`, `fetch`, `process.loadEnvFile`).
-- **Multi-Browser Support**: Connects seamlessly to Brave, Chrome, Microsoft Edge, or Chromium via remote debugging.
-- **Batch Submission**: Accepts single files, lists of files, directories, or glob patterns (e.g. `"candidates/*.csv"`).
-- **Fast 1s Polling with Early Exit**: Polls DOM status every second and captures scores immediately upon completion without unnecessary waiting.
-- **Token-Saving Progress Logging**: Emits clean state transitions instead of spamming stdout, making it ideal for LLM coding agents and subagents.
-- **Cross-Process FIFO Queue**: Multiple terminals or autonomous subagents coordinate safely through an atomic file-based FIFO lock with automatic dead-process eviction.
-- **Automated Leaderboard Standing**: Automatically opens/reloads the assignment leaderboard, extracts your rank ("No"), total participant count, and calculates your percentile (`(Rank / Highest) * 100%`).
+- **Zero dependencies**: Pure Node 22+. No puppeteer, no selenium, no bloated `node_modules`.
+- **Drop and walk away**: Point it at a file, a folder, or a glob (`"candidates/*.csv"`). It uploads, grabs the score, checks your leaderboard rank and percentile, and logs a clean summary table.
+- **Multi-agent queue**: If multiple background scripts or terminals submit at the same time, an atomic local FIFO queue makes them take turns instead of fighting over the same browser tab.
 
 ---
 
