@@ -51,8 +51,8 @@ const LEADERBOARD_URL = `${BASE_URL}/en/courses/${COURSE_ID}/assignments/${ASSIG
 const DEFAULT_BROWSER = (process.env.BROWSER || process.env.OMNICAMPUS_BROWSER || 'brave').toLowerCase();
 const DEFAULT_CDP_HOST = process.env.CDP_HOST || '127.0.0.1';
 const DEFAULT_CDP_PORT = parseInt(process.env.CDP_PORT || process.env.PORT || '9222', 10);
-const DEFAULT_WAIT_SECONDS = 60;
-const SETTLE_DELAY_MS = 2000;
+const DEFAULT_WAIT_SECONDS = 90;
+const SETTLE_DELAY_MS = 5000;
 
 const QUEUE_DIR = process.env.OMNICAMPUS_QUEUE_DIR || path.join(os.tmpdir(), 'omnicampus_submit_queue');
 const LOCK_FILE = path.join(QUEUE_DIR, 'active.lock');
