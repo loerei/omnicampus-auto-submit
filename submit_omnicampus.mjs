@@ -80,16 +80,27 @@ function cleanStaleQueueItems() {
   // Check active.lock
   if (fs.existsSync(LOCK_FILE)) {
     try {
-      const lockData = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
-      const isAlive = isProcessAlive(lockData.pid);
-      const isExpired = Date.now() - (lockData.acquiredAt || 0) > LOCK_TIMEOUT_MS;
+      const stat = fs.statSync(LOCK_FILE);
+      const ageMs = Date.now() - stat.mtimeMs;
+      // Grace period of 5 seconds to prevent race condition during atomic file creation/write
+      if (ageMs > 5000) {
+        let lockData = null;
+        try {
+          lockData = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
+        } catch {
+          try { fs.unlinkSync(LOCK_FILE); } catch {}
+        }
 
-      if (!isAlive || isExpired) {
-        try { fs.unlinkSync(LOCK_FILE); } catch {}
+        if (lockData) {
+          const isAlive = isProcessAlive(lockData.pid);
+          const isExpired = Date.now() - (lockData.acquiredAt || 0) > LOCK_TIMEOUT_MS;
+
+          if (!isAlive || isExpired) {
+            try { fs.unlinkSync(LOCK_FILE); } catch {}
+          }
+        }
       }
-    } catch {
-      try { fs.unlinkSync(LOCK_FILE); } catch {}
-    }
+    } catch {}
   }
 
   // Check ticket files
@@ -98,13 +109,23 @@ function cleanStaleQueueItems() {
     for (const f of files) {
       const p = path.join(QUEUE_DIR, f);
       try {
-        const ticket = JSON.parse(fs.readFileSync(p, 'utf8'));
-        if (!isProcessAlive(ticket.pid) || (Date.now() - (ticket.createdAt || 0) > LOCK_TIMEOUT_MS)) {
-          try { fs.unlinkSync(p); } catch {}
+        const stat = fs.statSync(p);
+        const ageMs = Date.now() - stat.mtimeMs;
+        if (ageMs > 5000) {
+          let ticket = null;
+          try {
+            ticket = JSON.parse(fs.readFileSync(p, 'utf8'));
+          } catch {
+            try { fs.unlinkSync(p); } catch {}
+          }
+
+          if (ticket) {
+            if (!isProcessAlive(ticket.pid) || (Date.now() - (ticket.createdAt || 0) > LOCK_TIMEOUT_MS)) {
+              try { fs.unlinkSync(p); } catch {}
+            }
+          }
         }
-      } catch {
-        try { fs.unlinkSync(p); } catch {}
-      }
+      } catch {}
     }
   } catch {}
 }
@@ -123,7 +144,7 @@ async function acquireQueueLock(fileTargets) {
     files: fileTargets.map(f => path.basename(f))
   };
 
-  fs.writeFileSync(ticketPath, JSON.stringify(ticketPayload), 'utf8');
+  fs.writeFileSync(ticketPath, JSON.stringify(ticketPayload), { encoding: 'utf8' });
 
   let released = false;
   const release = () => {
@@ -168,13 +189,11 @@ async function acquireQueueLock(fileTargets) {
     if (position === 1) {
       let acquired = false;
       try {
-        const fd = fs.openSync(LOCK_FILE, 'wx');
-        fs.writeFileSync(fd, JSON.stringify({
+        fs.writeFileSync(LOCK_FILE, JSON.stringify({
           pid: process.pid,
           ticketId,
           acquiredAt: Date.now()
-        }), 'utf8');
-        fs.closeSync(fd);
+        }), { flag: 'wx', encoding: 'utf8' });
         acquired = true;
       } catch (err) {
         if (err.code !== 'EEXIST') throw err;
@@ -812,6 +831,8 @@ async function main() {
     if (cdp) {
       try { cdp.close(); } catch {}
     }
+    // Settle delay before releasing queue lock to allow browser DOM and network to stabilize
+    await new Promise(r => setTimeout(r, 2500));
     queueLease.release();
   }
 }
