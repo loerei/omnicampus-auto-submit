@@ -166,26 +166,6 @@ When multiple subagents, automated pipelines, or terminal tabs invoke `submit_om
 
 ---
 
-## Spherical Manifold Simulator (`spherical_manifold_simulator.py`)
-
-GPU-accelerated geometric inspector for the 128-dimensional spherical manifold $\mathbb{S}^{127}$ of candidate models across 61,500 test samples.
-
-### Features
-- **Geodesic Support & Void Detection**: Evaluates cosine similarities and geodesic distance $d_{\mathbb{S}} = \arccos(z_{\text{te}}^T z_{\text{tr}})$ between test points and the training manifold on GPU tensor cores.
-- **Inter-Paradigm Discordance Measurement**: Measures rank spread and variance across 5 distinct learning paradigms (ExtraTrees, XGBoost CUDA, CatBoost GPU, LightGBM GOSS, ArcFace NN) to identify high-uncertainty decision boundaries.
-- **Spherical Manifold Clustering**: Clusters discordant points on $\mathbb{S}^{127}$ into discrete problem archetypes.
-- **Demographic & Financial Deconvolution**: Deconvolutes blind-spot cohorts against the full test population baseline across debt leverage, payment terms, and credit rating missingness.
-
-### CLI Usage
-```bash
-python .devutil/spherical_manifold_simulator.py \
-    --train-latents .scratch/oof_arcface_404col_embeddings_128d.npy \
-    --test-latents .scratch/test_arcface_404col_embeddings_128d.npy \
-    --output-report .scratch/spherical_manifold_diagnostic_report.md
-```
-
----
-
 ## License
 
 MIT License. Copyright (c) 2026 loerei.
